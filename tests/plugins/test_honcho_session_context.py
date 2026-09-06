@@ -2,7 +2,11 @@
 
 from types import SimpleNamespace
 
-from plugins.memory.honcho.session import HonchoSession, HonchoSessionManager
+from plugins.memory.honcho.session import (
+    HonchoAuthError,
+    HonchoSession,
+    HonchoSessionManager,
+)
 
 
 class _FakeSummary:
@@ -96,3 +100,143 @@ def test_session_context_user_alias_uses_user_self_observer_when_ai_cannot_obser
             "peer_perspective": "chris",
         }
     ]
+
+
+class _UnexpectedPeerCreation(BaseException):
+    """Raised by the fake SDK if search calls Honcho.peer()."""
+
+
+class _SearchHoncho:
+    def __init__(self, primary_messages):
+        self.primary_messages = primary_messages
+        self.search_calls = []
+
+    def search(self, query, filters, limit):
+        self.search_calls.append((query, filters, limit))
+        if isinstance(self.primary_messages, Exception):
+            raise self.primary_messages
+        return self.primary_messages
+
+    def peer(self, peer_id):
+        raise _UnexpectedPeerCreation(
+            f"honcho_search fallback must not create peer {peer_id!r}"
+        )
+
+
+def _search_manager(monkeypatch, primary_messages, fallback_messages):
+    """Build a search manager whose fallback can never call Honcho.peer()."""
+    mgr, _ = _manager_with_cached_session()
+    fake_honcho = _SearchHoncho(primary_messages)
+    constructed_peers = []
+
+    class _ReadOnlyPeer:
+        def __init__(self, peer_id, honcho):
+            assert peer_id == "chris"
+            assert honcho is fake_honcho
+            constructed_peers.append(peer_id)
+
+        def search(self, query, limit):
+            assert (query, limit) == ("older fact", 5)
+            return fallback_messages
+
+    monkeypatch.setattr(
+        "plugins.memory.honcho.session.get_honcho_client",
+        lambda config: fake_honcho,
+    )
+    monkeypatch.setattr("honcho.peer.Peer", _ReadOnlyPeer)
+    monkeypatch.setattr(mgr, "_authed_call", lambda op_name, operation: operation())
+    return mgr, fake_honcho, constructed_peers
+
+
+def test_search_context_keeps_primary_hit_and_skips_fallback(monkeypatch):
+    message = SimpleNamespace(
+        content="Chris said this in this session.", peer_id="chris", session_id="session"
+    )
+    mgr, fake_honcho, constructed_peers = _search_manager(monkeypatch, [message], [])
+
+    result = mgr.search_context("test-session", "older fact", max_tokens=400, peer="user")
+
+    assert "Chris said this in this session." in result
+    assert fake_honcho.search_calls == [("older fact", {"peer_perspective": "chris"}, 5)]
+    assert constructed_peers == []
+
+
+def test_search_context_falls_back_when_perspective_search_is_empty(monkeypatch):
+    """An empty perspective result must not hide peer-authored history."""
+    message = SimpleNamespace(
+        content="Chris said this in an older session.",
+        peer_id="chris",
+        session_id="older-session",
+    )
+    mgr, fake_honcho, constructed_peers = _search_manager(monkeypatch, [], [message])
+
+    result = mgr.search_context("test-session", "older fact", max_tokens=400, peer="user")
+
+    assert "Chris said this in an older session." in result
+    assert fake_honcho.search_calls == [("older fact", {"peer_perspective": "chris"}, 5)]
+    assert constructed_peers == ["chris"]
+
+
+def test_search_context_falls_back_when_perspective_search_raises(monkeypatch):
+    message = SimpleNamespace(
+        content="Chris said this in an older session.",
+        peer_id="chris",
+        session_id="older-session",
+    )
+    mgr, fake_honcho, constructed_peers = _search_manager(
+        monkeypatch, RuntimeError("unsupported filter"), [message]
+    )
+
+    result = mgr.search_context("test-session", "older fact", max_tokens=400, peer="user")
+
+    assert "Chris said this in an older session." in result
+    assert fake_honcho.search_calls == [("older fact", {"peer_perspective": "chris"}, 5)]
+    assert constructed_peers == ["chris"]
+
+
+def test_search_context_returns_empty_when_primary_and_fallback_miss(monkeypatch):
+    mgr, fake_honcho, constructed_peers = _search_manager(monkeypatch, [], [])
+
+    result = mgr.search_context("test-session", "older fact", max_tokens=400, peer="user")
+
+    assert result == ""
+    assert fake_honcho.search_calls == [("older fact", {"peer_perspective": "chris"}, 5)]
+    assert constructed_peers == ["chris"]
+
+
+def test_search_context_propagates_primary_auth_failure_without_fallback(monkeypatch):
+    mgr, _fake_honcho, constructed_peers = _search_manager(monkeypatch, [], [])
+
+    def _auth_failure(op_name, operation):
+        assert op_name == "message search"
+        raise HonchoAuthError("primary rejected")
+
+    monkeypatch.setattr(mgr, "_authed_call", _auth_failure)
+    try:
+        mgr.search_context("test-session", "older fact", max_tokens=400, peer="user")
+    except HonchoAuthError as exc:
+        assert str(exc) == "primary rejected"
+    else:
+        raise AssertionError("expected primary authentication failure")
+    assert constructed_peers == []
+
+
+def test_search_context_propagates_fallback_auth_failure_without_peer_creation(monkeypatch):
+    mgr, _fake_honcho, constructed_peers = _search_manager(monkeypatch, [], [])
+    calls = []
+
+    def _auth_failure(op_name, operation):
+        calls.append(op_name)
+        if op_name == "peer search":
+            raise HonchoAuthError("fallback rejected")
+        return operation()
+
+    monkeypatch.setattr(mgr, "_authed_call", _auth_failure)
+    try:
+        mgr.search_context("test-session", "older fact", max_tokens=400, peer="user")
+    except HonchoAuthError as exc:
+        assert str(exc) == "fallback rejected"
+    else:
+        raise AssertionError("expected fallback authentication failure")
+    assert calls == ["message search", "peer search"]
+    assert constructed_peers == []
