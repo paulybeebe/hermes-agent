@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 interface ListenerEntry {
   callback: (event: any) => void
@@ -99,11 +102,39 @@ vi.mock('undici', () => ({ WebSocket: FakeWebSocket }))
 
 import {
   GatewayClient,
+  profileScopedGatewayEnv,
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
   WS_HEARTBEAT_DEAD_MS,
   WS_HEARTBEAT_INTERVAL_MS
 } from '../gatewayClient.js'
+
+describe('profileScopedGatewayEnv', () => {
+  it('removes secrets inherited from a different profile before spawning the gateway', () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-forge-'))
+
+    try {
+      writeFileSync(
+        join(home, '.env'),
+        'OPENROUTER_API_KEY=profile-key\nTELEGRAM_BOT_TOKEN=profile-token\n',
+        'utf8'
+      )
+      const env = profileScopedGatewayEnv({
+        HERMES_HOME: home,
+        OPENROUTER_API_KEY: 'default-key',
+        TELEGRAM_BOT_TOKEN: 'default-token',
+        UNRELATED_SETTING: 'keep-me'
+      })
+
+      expect(env.HERMES_HOME).toBe(home)
+      expect(env.OPENROUTER_API_KEY).toBeUndefined()
+      expect(env.TELEGRAM_BOT_TOKEN).toBeUndefined()
+      expect(env.UNRELATED_SETTING).toBe('keep-me')
+    } finally {
+      rmSync(home, { force: true, recursive: true })
+    }
+  })
+})
 
 describe('GatewayClient websocket attach mode', () => {
   const originalWebSocket = globalThis.WebSocket

@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync } from 'node:fs'
-import { delimiter, resolve } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { delimiter, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import type { GatewayEvent } from '@hermes/shared/gateway-events'
@@ -53,6 +53,37 @@ const describeChild = (proc: ChildProcess | null) => {
   }
 
   return `pid=${proc.pid ?? 'unknown'} killed=${proc.killed} exitCode=${proc.exitCode ?? 'null'} signal=${proc.signalCode ?? 'null'}`
+}
+
+/**
+ * A profile's .env is its secret boundary. The dashboard can switch profiles
+ * while its own process still carries the default profile's credentials, so a
+ * spawned gateway must not inherit variables that the selected profile owns.
+ * Python then loads the selected profile's .env during startup.
+ */
+export const profileScopedGatewayEnv = (parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  const env = { ...parentEnv }
+  const hermesHome = env.HERMES_HOME?.trim()
+
+  if (!hermesHome) {
+    return env
+  }
+
+  try {
+    const dotenv = readFileSync(join(hermesHome, '.env'), 'utf8')
+
+    for (const line of dotenv.split(/\r?\n/)) {
+      const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/)
+
+      if (match?.[1]) {
+        delete env[match[1]]
+      }
+    }
+  } catch {
+    // No profile .env: preserve the parent environment for legacy setups.
+  }
+
+  return env
 }
 
 const resolveGatewayAttachUrl = () => {
@@ -428,7 +459,7 @@ export class GatewayClient extends EventEmitter {
   private startSpawnedGateway(root: string) {
     const python = resolvePython(root)
     const cwd = process.env.HERMES_CWD || root
-    const env = { ...process.env }
+    const env = profileScopedGatewayEnv(process.env)
     const pyPath = env.PYTHONPATH?.trim()
 
     env.PYTHONPATH = pyPath ? `${root}${delimiter}${pyPath}` : root
