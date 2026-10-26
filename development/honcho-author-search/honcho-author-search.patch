@@ -1,0 +1,90 @@
+--- a/session_context.py
++++ b/session_context.py
+@@ -222,9 +222,10 @@
+         return self._guarded_session(session_key, _fetch, [], logging.DEBUG, "Failed to fetch peer card from Honcho: %s")
+ 
+     def search_context(self, session_key: str, query: str, max_tokens: int = 800, peer: str = "user") -> str:
+-        """Hybrid search over raw messages visible from ``peer``'s perspective, all sessions. Snippets
++        """Hybrid search over messages authored by ``peer``, across all sessions. Snippets
+         accumulate until ``max_tokens`` (~4 chars/token) is exhausted. Returns "" when nothing matches;
+-        raises HonchoAuthError on rejected credentials."""
++        raises on backend failure (including HonchoAuthError on rejected credentials),
++        so a failed search cannot be reported as an empty result."""
+         session = self._cached_session(session_key)
+         q = (query or "").strip()[:4000]  # Honcho caps query length for the embedding model.
+         if not session or not q:
+@@ -232,16 +233,9 @@
+         peer_id = self._resolve_peer_id(session, peer)
+         char_budget = max(200, int(max_tokens) * 4)
+         limit = max(3, min(20, char_budget // 300))
+-        messages = self._guarded_authed(
+-            "message search", lambda: self.honcho.search(q, filters={"peer_perspective": peer_id}, limit=limit),
+-            _FAILED, logging.DEBUG, "Honcho message search failed (peer_perspective=%s): %s", peer_id,
++        messages = self._authed_call(
++            "message search", lambda: self.honcho.search(q, filters={"peer_id": peer_id}, limit=limit),
+         )
+-        if messages is _FAILED:
+-            # Older Honcho versions lack the perspective filter; fall back to peer-authored search.
+-            messages = self._guarded_authed(
+-                "peer search", lambda: self._get_or_create_peer(peer_id).search(q, limit=limit),
+-                None, logging.DEBUG, "Honcho peer search fallback also failed: %s",
+-            )
+         if not messages:
+             return ""
+         # Author labels distinguish user-stated facts from assistant-derived ones.
+--- a/tool_schemas.py
++++ b/tool_schemas.py
+@@ -33,11 +33,11 @@
+ 
+ SEARCH_SCHEMA = _tool(
+     "honcho_search",
+-    "Hybrid (semantic + keyword) search over a peer's actual message "
+-    "history across ALL past sessions they took part in — not just the "
+-    "current one. Returns RRF-ranked raw message excerpts (what was "
+-    "literally said, including the assistant's own messages about the "
+-    "peer), no LLM synthesis. Cheaper and faster than honcho_reasoning. "
++    "Hybrid search over messages AUTHORED by the selected peer across all sessions. "
++    "Default user searches the human's words only; ai searches this assistant's "
++    "words. Search both when recalling a conversation or decision, and use an "
++    "explicit agent peer ID for another assistant. Returns labelled raw excerpts, "
++    "not all messages visible to that peer and not LLM synthesis. "
+     "Use this to recall specific past facts — 'what did I say about X', "
+     "'what was the regimen/decision/config we settled on' — and reason "
+     "over the excerpts yourself. For nuanced questions needing synthesis, "
+@@ -47,7 +47,7 @@
+      "max_tokens": {"type": "integer",
+                     "description": "Approximate budget for returned excerpts (default 800, max 2000). Larger budgets return more/longer ranked snippets."},
+      "peer": {"type": "string",
+-              "description": "Whose history to search. Built-in aliases: 'user' (default), 'ai'. Or pass any peer ID from this workspace. Spans every session that peer took part in."}},
++              "description": "Message author: 'user' (default), 'ai' (current assistant), or an explicit peer ID in this workspace. Search user and ai separately for both sides of a conversation."}},
+     ["query"],
+ )
+ 
+--- a/__init__.py
++++ b/__init__.py
+@@ -1238,11 +1238,11 @@
+ SEARCH_SCHEMA = {
+     "name": "honcho_search",
+     "description": (
+-        "Hybrid (semantic + keyword) search over a peer's actual message "
+-        "history across ALL past sessions they took part in — not just the "
+-        "current one. Returns RRF-ranked raw message excerpts (what was "
+-        "literally said, including the assistant's own messages about the "
+-        "peer), no LLM synthesis. Cheaper and faster than honcho_reasoning. "
++        "Hybrid search over messages AUTHORED by the selected peer across all sessions. "
++        "Default user searches the human's words only; ai searches this assistant's "
++        "words. Search both when recalling a conversation or decision, and use an "
++        "explicit agent peer ID for another assistant. Returns labelled raw excerpts, "
++        "not all messages visible to that peer and not LLM synthesis. "
+         "Use this to recall specific past facts — 'what did I say about X', "
+         "'what was the regimen/decision/config we settled on' — and reason "
+         "over the excerpts yourself. For nuanced questions needing synthesis, "
+@@ -1261,7 +1261,7 @@
+             },
+             "peer": {
+                 "type": "string",
+-                "description": "Whose history to search. Built-in aliases: 'user' (default), 'ai'. Or pass any peer ID from this workspace. Spans every session that peer took part in.",
++                "description": "Message author: 'user' (default), 'ai' (current assistant), or an explicit peer ID in this workspace. Search user and ai separately for both sides of a conversation.",
+             },
+         },
+         "required": ["query"],
